@@ -1,0 +1,20 @@
+# Windows 7 x64 兼容构建 —— 锁定版本（Python 3.8.10）
+#
+# 选版依据（均为「最后一个在 Win7 上可用」的版本）：
+#   Python 3.8.10    最后一个带 Windows 安装包、且官方支持 Win7 的 Python
+#   onnxruntime 1.11.1  官方最后支持 Win7/8 的版本（1.12+ 起引入 Win8+ API 集）
+#   ddddocr 1.5.6    1.6.0 起要求 Python >= 3.10
+#   opencv-python 4.5.5.64  最后一个 Win7 可用的 opencv 轮子
+#   numpy 1.23.5     1.x 最后几个版本之一（2.x 会破坏 onnxruntime 1.11）
+#   pyinstaller 5.13.2  5.x 系列最后版本，bootloader 兼容 Win7
+pyinstaller==5.13.2
+pyinstaller-hooks-contrib==2023.8
+requests==2.31.0
+openpyxl==3.1.2
+pillow==9.5.0
+numpy==1.23.5
+opencv-python-headless==4.5.5.64
+onnxruntime==1.11.1
+ddddocr==1.5.6
+sv-ttk==2.6.0
+tqdm==4.66.4

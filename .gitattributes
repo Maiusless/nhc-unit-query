@@ -1,0 +1,15 @@
+# 换行符统一：仓库内一律 LF，避免跨平台差异
+* text=auto eol=lf
+
+# 二进制文件不做换行转换
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.exe  binary
+*.dll  binary
+*.pyd  binary
+*.onnx binary
+
+# 语言标注（GitHub 统计用）
+*.py   text diff=python
+*.md   text
