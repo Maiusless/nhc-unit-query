@@ -6,6 +6,7 @@
     结果表（文本表，可拖动选中复制；「详细」为蓝色链接，点击看机构详情）
     模态实时进度窗（查询期间锁住主窗口，避免并发误操作）
 """
+import base64
 import csv
 import io
 import json
@@ -214,6 +215,79 @@ def subject_icon(name):
         if key in s:
             return icon
     return SUBJECT_ICON_DEFAULT
+
+
+# 彩色图标缓存：key = (Tk 解释器, 字符, 像素尺寸)
+_ICON_CACHE = {}
+_ICON_CROSS_COLOR = (211, 47, 47)     # 外科的红十字
+
+
+def _emoji_font_path():
+    """彩色 emoji 字体（Win8.1+ 自带）。Win7 只有单色 Segoe UI Symbol，返回 None。"""
+    root = os.environ.get("WINDIR") or r"C:\Windows"
+    p = os.path.join(root, "Fonts", "seguiemj.ttf")
+    return p if os.path.exists(p) else None
+
+
+def _draw_cross(px, color=_ICON_CROSS_COLOR):
+    """外科没有合适的 emoji（✚ 不是彩色字符），直接画一个红十字。"""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    arm = max(4, int(round(px * 0.32)))
+    th = max(3, int(round(px * 0.32)))
+    c = px // 2
+    r = max(1, th // 3)
+    d.rounded_rectangle([c - th / 2.0, c - arm, c + th / 2.0, c + arm],
+                        radius=r, fill=color + (255,))
+    d.rounded_rectangle([c - arm, c - th / 2.0, c + arm, c + th / 2.0],
+                        radius=r, fill=color + (255,))
+    return img
+
+
+def _subject_icon_photo(master, ch, px):
+    """把 emoji 渲染成彩色 PNG（Tk 8.6 的文字控件不支持彩色 emoji）。
+
+    返回 PhotoImage；环境不支持彩色渲染（Win7 / Pillow 异常）时返回 None，
+    调用方退回单色文字图标。
+    """
+    try:
+        key = (master.tk.interpaddr(), ch, px)
+    except Exception:
+        key = (id(master.tk), ch, px)
+    hit = _ICON_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        if ch == "✚":
+            img = _draw_cross(px)
+        else:
+            fp = _emoji_font_path()
+            if not fp:
+                return None
+            font = ImageFont.truetype(fp, int(px))
+            img = Image.new("RGBA", (px, px), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            bb = d.textbbox((0, 0), ch, font=font, embedded_color=True)
+            w, h = bb[2] - bb[0], bb[3] - bb[1]
+            if w <= 0 or h <= 0:
+                return None
+            d.text(((px - w) / 2.0 - bb[0], (px - h) / 2.0 - bb[1]), ch,
+                   font=font, embedded_color=True)
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        photo = tk.PhotoImage(
+            master=master,
+            data=base64.b64encode(buf.getvalue()).decode("ascii"))
+        _ICON_CACHE[key] = photo
+        return photo
+    except Exception:
+        return None
+
+
+def _is_blank(v):
+    return str(v if v is not None else "").strip() in ("", "—", "-", "/", "无")
 
 
 def _split_outside_brackets(s, seps):
@@ -780,6 +854,12 @@ class DetailDialog(MemoWindow):
         vsb.pack(side="right", fill="y")
         self.txt.pack(side="left", fill="both", expand=True)
 
+        # 彩色图标按屏幕 DPI 生成，125%/150% 缩放下不会显小
+        try:
+            self._icon_px = max(14, int(round(18 * float(self.winfo_fpixels("1i")) / 96.0)))
+        except Exception:
+            self._icon_px = 18
+
         self.txt.tag_configure("grp", font=("Microsoft YaHei UI", 10, "bold"),
                                foreground=pal["accent"], spacing1=10, spacing3=4)
         self.txt.tag_configure("lbl", font=("Microsoft YaHei UI", 10),
@@ -805,7 +885,10 @@ class DetailDialog(MemoWindow):
         for gname, fields in detail_groups(self._detail.get("unitType")):
             if len(fields) == 1 and fields[0][0] == "unitSubjectName":
                 shown.add("unitSubjectName")
-                self._insert_subjects(gname, self._detail.get("unitSubjectName"))
+                raw = self._detail.get("unitSubjectName")
+                if _is_blank(raw):
+                    continue        # 官网对空科目整段不显示，这里保持一致
+                self._insert_subjects(gname, raw)
                 continue
             self.txt.insert("end", gname + "\n", "grp")
             for key, label in fields:
@@ -942,7 +1025,14 @@ class DetailDialog(MemoWindow):
                 i = (i + 1) % n
             prev = i
             tag = "sc%d" % i
-            self.txt.insert("end", subject_icon(name) + " ", "sicon")
+            icon = subject_icon(name)
+            photo = _subject_icon_photo(self.txt, icon, self._icon_px)
+            if photo is not None:
+                # 图片不参与文字内容：拖动选中复制时不会带出图标
+                self.txt.image_create("end", image=photo, align="center", padx=5)
+            else:
+                # Win7（无彩色 emoji 字体）退回单色文字图标
+                self.txt.insert("end", icon + " ", "sicon")
             self.txt.insert("end", name + "\n", ("sname", tag))
             if subs:
                 self.txt.insert("end", "    " + " · ".join(subs) + "\n", "ssub")
@@ -951,6 +1041,11 @@ class DetailDialog(MemoWindow):
         """复制内容与窗口显示保持一致（含"官网未展示"的补充字段）。"""
         rows, shown = [], set()
         for _g, fields in detail_groups(self._detail.get("unitType")):
+            # 空科目在界面上整段隐藏，复制也保持一致，不输出「诊疗科目：—」
+            if len(fields) == 1 and fields[0][0] == "unitSubjectName" \
+                    and _is_blank(self._detail.get("unitSubjectName")):
+                shown.add("unitSubjectName")
+                continue
             for k, lbl in fields:
                 rows.append("%s：%s" % (lbl, _fmt(self._detail.get(k), k)))
                 shown.add(k)
