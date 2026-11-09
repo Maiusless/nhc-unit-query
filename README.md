@@ -122,6 +122,7 @@ Python 3.9+ 打包出的 exe **无法在 Windows 7 上运行**：`python3x.dll` 
 另外，Python 3.8 自身依赖 UCRT（Win7 需补丁 KB2999226），打包脚本会把
 Windows SDK 里 `Redist\ucrt\DLLs\x64` 的 **41 个 DLL 一并打进包**
 （微软文档支持的 app-local 部署），客户机不装补丁也能跑。
+若构建机没装 SDK，也可用从 KB2999226 提取的 24 个 UCRT 运行库（`C:\Environment\SDKs\UCRT\x64`），效果相同。
 
 ### 准备环境
 
@@ -151,7 +152,7 @@ C:\py38\python.exe -m venv .venv38
 .venv38\Scripts\python.exe build_exe.py --gui-only        :: 只打图形界面
 ```
 
-打包脚本会自动完成两件事：**附带 UCRT 41 个 DLL**、**打包后跑 Win7 兼容性扫描**。
+打包脚本会自动完成两件事：**附带 UCRT 运行库**（SDK 的 41 个，或 KB2999226 提取的 24 个）、**打包后跑 Win7 兼容性扫描**。
 
 ### 自检工具
 

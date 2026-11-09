@@ -1947,9 +1947,12 @@ class App(tk.Tk):
             return False
 
     def _run_engine(self):
-        self.engine.start()
-        self.engine.join()
-        self.events.put(("done", None))
+        try:
+            self.engine.start()
+            self.engine.join()
+        finally:
+            # 无论引擎怎么退出，都要发 done —— 否则覆盖层会一直挂着
+            self.events.put(("done", None))
 
     def _stop(self):
         if self.engine:
@@ -2231,10 +2234,13 @@ class App(tk.Tk):
                     n, len(todo), "抓取详情 - %s%s" % (nm, "" if not f else "  (失败 %d)" % f)))
                 safe(self._refresh_ip)
 
-            with ThreadPoolExecutor(max_workers=min(6, len(todo))) as ex:
-                list(ex.map(one, todo))
-            safe(ov.close)
-            safe(lambda: finished.set(True))
+            try:
+                with ThreadPoolExecutor(max_workers=min(6, len(todo))) as ex:
+                    list(ex.map(one, todo))
+            finally:
+                # 即使抓取过程中抛异常，也要关掉覆盖层并放行主线程
+                safe(ov.close)
+                safe(lambda: finished.set(True))
 
         threading.Thread(target=work, daemon=True).start()
         try:
