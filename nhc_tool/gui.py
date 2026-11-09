@@ -165,10 +165,55 @@ SUBJECT_COLORS = {
     "dark": ("#7bb8ff", "#54d2b4", "#c9a6ff", "#ffb473", "#8be0a8", "#ff9fc6"),
 }
 
-# 每个科室前的符号。Tk 8.6 走 GDI 渲染，emoji 是**单色线条**（不是彩色），
-# 且只能选 Unicode 6.0 时代的老 emoji（Win7 的 Segoe UI Symbol 才有字形）；
-# 想换图标改这一行即可，改回 "▍" 就是原来的竖条。
-SUBJECT_BULLET = "🏥"
+# 科室语义图标：按关键词匹配（**顺序有意义**，"小儿/妇女保健"等特例要排在前面）。
+# 只选 Unicode 6.0 / BMP 时代的老字符 —— Win7 的 Segoe UI Symbol 才有字形，
+# 新 emoji（🫀🦷🩺🧠…）在 Win7 上会显示成方块。
+# 图标统一用中性灰（不跟随科室颜色），想换某个科直接改这张表。
+SUBJECT_ICONS = (
+    ("中西医结合", "☯"),
+    ("中医", "🌿"),
+    ("妇女保健", "♀"),
+    ("妇产", "♀"),
+    ("小儿", "👶"),
+    ("儿童保健", "🍼"),
+    ("儿科", "👶"),
+    ("预防", "💉"),
+    ("全科", "🏥"),
+    ("内科", "❤"),
+    ("外科", "✚"),
+    ("眼科", "👓"),
+    ("耳鼻咽喉", "👂"),
+    ("耳鼻喉", "👂"),
+    ("口腔", "👄"),
+    ("皮肤", "✨"),
+    ("美容", "💅"),
+    ("心理", "💬"),
+    ("结核", "☣"),
+    ("传染", "😷"),
+    ("地方病", "🌍"),
+    ("肿瘤", "💊"),
+    ("急诊", "🚑"),
+    ("康复", "💆"),
+    ("职业", "🏭"),
+    ("临终", "💤"),
+    ("麻醉", "💤"),
+    ("疼痛", "⚡"),
+    ("重症", "💉"),
+    ("检验", "🔬"),
+    ("病理", "🔍"),
+    ("影像", "📷"),
+    ("放射", "📷"),
+)
+SUBJECT_ICON_DEFAULT = "🏥"
+
+
+def subject_icon(name):
+    """按科室名挑一个语义相近的图标；匹配不到就用医院图标兜底。"""
+    s = name or ""
+    for key, icon in SUBJECT_ICONS:
+        if key in s:
+            return icon
+    return SUBJECT_ICON_DEFAULT
 
 
 def _split_outside_brackets(s, seps):
@@ -752,6 +797,9 @@ class DetailDialog(MemoWindow):
                                spacing3=6)
         self.txt.tag_configure("scount", font=("Microsoft YaHei UI", 9),
                                foreground=pal["sub"], spacing3=2)
+        # 科室图标：比科名大 1pt 更清楚，但保持中性灰、不跟随科室颜色
+        self.txt.tag_configure("sicon", font=("Microsoft YaHei UI", 12),
+                               foreground=pal["sub"])
 
         shown = set()
         for gname, fields in detail_groups(self._detail.get("unitType")):
@@ -860,6 +908,7 @@ class DetailDialog(MemoWindow):
             self.txt.tag_configure("sep", foreground=pal["line"])
             self.txt.tag_configure("ssub", foreground=pal["sub"])
             self.txt.tag_configure("scount", foreground=pal["sub"])
+            self.txt.tag_configure("sicon", foreground=pal["sub"])
             for i, c in enumerate(colors):
                 self.txt.tag_configure("sc%d" % i, foreground=c)
         except Exception:
@@ -893,7 +942,7 @@ class DetailDialog(MemoWindow):
                 i = (i + 1) % n
             prev = i
             tag = "sc%d" % i
-            self.txt.insert("end", SUBJECT_BULLET + " ", tag)
+            self.txt.insert("end", subject_icon(name) + " ", "sicon")
             self.txt.insert("end", name + "\n", ("sname", tag))
             if subs:
                 self.txt.insert("end", "    " + " · ".join(subs) + "\n", "ssub")
