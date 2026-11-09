@@ -3,7 +3,7 @@ import os
 import sys
 
 APP_NAME = "卫健信用查询工具"
-APP_VER = "1.1.1"
+APP_VER = "1.1.2"
 
 BASE = "https://zgcx.nhc.gov.cn"
 DATA = BASE + "/DATA"

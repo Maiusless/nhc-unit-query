@@ -257,7 +257,11 @@ def _subject_icon_photo(master, ch, px):
         key = (id(master.tk), ch, px)
     hit = _ICON_CACHE.get(key)
     if hit is not None:
-        return hit
+        try:
+            hit.width()          # 解释器重开后旧 PhotoImage 会失效，别复用它
+            return hit
+        except Exception:
+            _ICON_CACHE.pop(key, None)
     try:
         from PIL import Image, ImageDraw, ImageFont
         if ch == "✚":
@@ -944,7 +948,7 @@ class DetailDialog(MemoWindow):
             self._icon_px = 18
 
         self.txt.tag_configure("grp", font=("Microsoft YaHei UI", 10, "bold"),
-                               foreground=pal["accent"], spacing1=10, spacing3=4)
+                               foreground=pal["accent"], spacing1=6, spacing3=4)
         self.txt.tag_configure("lbl", font=("Microsoft YaHei UI", 10),
                                foreground=pal["sub"])
         self.txt.tag_configure("val", font=("Microsoft YaHei UI", 10),
@@ -964,15 +968,27 @@ class DetailDialog(MemoWindow):
         self.txt.tag_configure("sicon", font=("Microsoft YaHei UI", 12),
                                foreground=pal["sub"])
 
+        # 分栏分割线用内嵌 Frame 实现（Text 里没法画真正的横线）：
+        # 记下所有 Frame，窗口变宽变窄时统一改宽度
+        self._seps = []
+        self.txt.bind("<Configure>", self._sync_seps, add="+")
+
         shown = set()
+        first_group = True
         for gname, fields in detail_groups(self._detail.get("unitType")):
             if len(fields) == 1 and fields[0][0] == "unitSubjectName":
                 shown.add("unitSubjectName")
                 raw = self._detail.get("unitSubjectName")
                 if _is_blank(raw):
                     continue        # 官网对空科目整段不显示，这里保持一致
+                if not first_group:
+                    self._add_sep()
+                first_group = False
                 self._insert_subjects(gname, raw)
                 continue
+            if not first_group:
+                self._add_sep()
+            first_group = False
             self.txt.insert("end", gname + "\n", "grp")
             for key, label in fields:
                 # 官网对空值字段同样显示标签，这里保持一致（空值显示为 —）
@@ -985,6 +1001,9 @@ class DetailDialog(MemoWindow):
                 and k not in ("unitGuid", "unitType", "unitName")
                 and v not in (None, "")]
         if rest:
+            if not first_group:
+                self._add_sep()
+            first_group = False
             self.txt.insert("end", "其它（接口返回，官网未展示）\n", "grp")
             for key, val in rest:
                 self.txt.insert("end", KEY_LABELS.get(key, key) + "\t", "lbl")
@@ -995,10 +1014,13 @@ class DetailDialog(MemoWindow):
         add_copy_menu(self.txt, self)
 
         foot = ttk.Frame(self, padding=(20, 12))
-        foot.pack(fill="x")
+        # before=outer：底栏要先分到固定高度，否则窗口不够高时它会被正文挤压
+        # （正文 Text 请求 24 行，默认 680 高的窗口里底栏只剩 2px，按钮直接看不见）
+        foot.pack(side="bottom", fill="x", before=outer)
         ttk.Label(foot, text="可拖动选中复制；科目按科分色，复制内容仍为官网原文",
                   style="Sub.TLabel").pack(side="left")
-        ttk.Button(foot, text="复制全部", command=self._copy).pack(side="right")
+        self.btn_copy = ttk.Button(foot, text="复制全部", command=self._copy)
+        self.btn_copy.pack(side="right")
         ttk.Button(foot, text="关闭", style="Accent.TButton",
                    command=self.destroy).pack(side="right", padx=8)
 
@@ -1077,6 +1099,8 @@ class DetailDialog(MemoWindow):
             self.txt.tag_configure("sicon", foreground=pal["sub"])
             for i, c in enumerate(colors):
                 self.txt.tag_configure("sc%d" % i, foreground=c)
+            for line in getattr(self, "_seps", []):
+                line.configure(bg=pal["line"])
         except Exception:
             pass
 
@@ -1090,6 +1114,37 @@ class DetailDialog(MemoWindow):
 
     def _pal(self):
         return PALETTE[self._theme_name()]
+
+    # ---- 分栏分割线 ----
+    def _add_sep(self):
+        """在两组字段之间插一条 1px 分割线。
+
+        Text 控件画不了真正的横线，这里内嵌一个高度 1px 的 Frame；
+        宽度在 `_sync_seps()` 里跟着窗口宽度调整，视觉上就是通栏细线。
+        内嵌窗口不参与 `get()`，复制文字不会带出多余字符。
+        """
+        try:
+            line = tk.Frame(self.txt, height=1, bg=self._pal()["line"],
+                            bd=0, highlightthickness=0, width=200)
+            self._seps.append(line)
+            self.txt.window_create("end", window=line, align="center",
+                                   padx=0, pady=9)
+            self.txt.insert("end", "\n")
+            self._sync_seps()
+        except Exception:
+            pass
+
+    def _sync_seps(self, _ev=None):
+        """让分割线铺满正文宽度（减去左右内边距与滚动条）。"""
+        try:
+            width = max(120, self.txt.winfo_width() - 48)
+        except Exception:
+            return
+        for line in self._seps:
+            try:
+                line.configure(width=width)
+            except Exception:
+                pass
 
     # ---- 诊疗科目 ----
     def _insert_subjects(self, title, raw):
@@ -1140,7 +1195,16 @@ class DetailDialog(MemoWindow):
         try:
             self.clipboard_clear()
             self.clipboard_append(txt)
-            messagebox.showinfo("已复制", "详情已复制到剪贴板", parent=self)
+            # 不弹提示框（复制这种高频动作弹窗打断感太强），直接在按钮上反馈
+            self.btn_copy.config(text="已复制 ✓")
+            self.after(1500, self._reset_copy_btn)
+        except Exception:
+            pass
+
+    def _reset_copy_btn(self):
+        try:
+            if self.winfo_exists():
+                self.btn_copy.config(text="复制全部")
         except Exception:
             pass
 
@@ -1539,14 +1603,26 @@ class App(tk.Tk):
         ttk.Label(self.st, textvariable=self.var_ip, style="Sub.TLabel").pack(side="right")
         ttk.Button(self.st, text="日志", command=self._toggle_log).pack(side="right", padx=(8, 14))
         # 「日志」按钮左边的一行小字（刻意做得不起眼）
-        # emoji 是非 BMP 字符，极老的 Tcl/Tk 可能不支持 —— 退化成纯文字，别因此起不来
-        try:
-            self.lbl_whisper = ttk.Label(self.st, text="今天也要准时下班哦🥰🥰~",
-                                         style="Whisper.TLabel")
-        except Exception:
-            self.lbl_whisper = ttk.Label(self.st, text="今天也要准时下班哦~",
-                                         style="Whisper.TLabel")
+        # Tk 8.6 的文字控件渲染不出彩色 emoji，这里把 🥰 用 Pillow 画成图片再贴上去；
+        # 没有彩色字体（Win7）时退回单色文字，保证不会变成方块。
+        self.lbl_whisper = ttk.Frame(self.st)
         self.lbl_whisper.pack(side="right", padx=(0, 12))
+        try:
+            px = max(11, int(round(12.5 * float(self.winfo_fpixels("1i")) / 96.0)))
+        except Exception:
+            px = 14
+        ttk.Label(self.lbl_whisper, text="今天也要准时下班哦",
+                  style="Whisper.TLabel").pack(side="left")
+        for _ in range(2):
+            photo = _subject_icon_photo(self.lbl_whisper, "🥰", px)
+            if photo is not None:
+                ttk.Label(self.lbl_whisper, image=photo,
+                          style="Whisper.TLabel").pack(side="left", padx=(1, 0))
+            else:
+                ttk.Label(self.lbl_whisper, text="🥰",
+                          style="Whisper.TLabel").pack(side="left")
+        ttk.Label(self.lbl_whisper, text="~",
+                  style="Whisper.TLabel").pack(side="left")
 
     def _build_table(self):
         """结果表：用 Text 实现——支持拖动选中与 Ctrl+C 复制，且可做蓝色链接。"""
