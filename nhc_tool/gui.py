@@ -1303,8 +1303,13 @@ class App(tk.Tk):
         ttk.Label(self.st, textvariable=self.var_ip, style="Sub.TLabel").pack(side="right")
         ttk.Button(self.st, text="日志", command=self._toggle_log).pack(side="right", padx=(8, 14))
         # 「日志」按钮左边的一行小字（刻意做得不起眼）
-        self.lbl_whisper = ttk.Label(self.st, text="今天也要准时下班哦🥰🥰~",
-                                     style="Whisper.TLabel")
+        # emoji 是非 BMP 字符，极老的 Tcl/Tk 可能不支持 —— 退化成纯文字，别因此起不来
+        try:
+            self.lbl_whisper = ttk.Label(self.st, text="今天也要准时下班哦🥰🥰~",
+                                         style="Whisper.TLabel")
+        except Exception:
+            self.lbl_whisper = ttk.Label(self.st, text="今天也要准时下班哦~",
+                                         style="Whisper.TLabel")
         self.lbl_whisper.pack(side="right", padx=(0, 12))
 
     def _build_table(self):
