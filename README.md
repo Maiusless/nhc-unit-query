@@ -60,7 +60,7 @@
 
 | 查询进度（窗内覆盖） | 设置 | 运行日志 |
 |---|---|---|
-| ![进度](docs/images/ui_progress.png) | ![设置](docs/images/ui_settings.png) | ![日志](docs/images/ui_log.png) |
+| ![进度](docs/images/ui_busy.png) | ![设置](docs/images/ui_settings.png) | ![日志](docs/images/ui_log.png) |
 
 | 顶部：数据截止时间 + 访问官网 | 结果可拖动选中 / 复制 |
 |---|---|
