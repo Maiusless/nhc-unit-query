@@ -42,6 +42,8 @@ WORK_DIR = "build"           # PyInstaller 中间产物（已 gitignore）
 UCRT_CANDIDATES = [
     r"C:\Program Files (x86)\Windows Kits\10\Redist\ucrt\DLLs\x64",
     r"C:\Program Files\Windows Kits\10\Redist\ucrt\DLLs\x64",
+    # 未安装 Windows SDK 时，用从 KB2999226（Win7 UCRT 更新）里提取的同版本运行库
+    r"C:\Environment\SDKs\UCRT\x64",
 ]
 
 # 产物自检工具

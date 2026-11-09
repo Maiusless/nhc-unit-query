@@ -552,6 +552,16 @@ def remember_window(key, geo):
 _POS_RE = re.compile(r"^([+-]\d+)([+-]\d+)$")
 
 
+def _bad_geo(geo):
+    """+0+0 视为无效：多为窗口映射前就被记下的默认位置。"""
+    g = str(geo or "")
+    m = _GEO_RE.match(g)
+    if m:
+        return int(m.group(3)) == 0 and int(m.group(4)) == 0
+    m = _POS_RE.match(g)
+    return bool(m and int(m.group(1)) == 0 and int(m.group(2)) == 0)
+
+
 def place_memo_window(win, key, parent=None, size=None, keep_size=True,
                       minsize=(200, 120)):
     """第一次居中，之后回到上次位置（keep_size=False 时只记位置不记尺寸）。"""
@@ -559,6 +569,8 @@ def place_memo_window(win, key, parent=None, size=None, keep_size=True,
         win.update_idletasks()
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
         saved = window_geometry(key)
+        if saved and _bad_geo(saved):
+            saved = None            # 历史脏数据（+0+0），当作没有记录
         geo = valid_geometry(saved, minsize, (sw, sh))
         if not geo and saved:
             # 只存了位置（尺寸固定的弹窗）：用当前自然尺寸补全
@@ -616,9 +628,11 @@ class MemoWindow(tk.Toplevel):
             return
         try:
             st = self.state()
-            if st in ("iconic", "withdrawn"):
-                return                     # 最小化状态下不覆盖上次的位置
+            if st in ("iconic", "withdrawn") or not self.winfo_ismapped():
+                return                     # 最小化/还没显示出来，不覆盖上次的位置
             g = self.winfo_geometry()
+            if _bad_geo(g):
+                return
             if not self.geo_keep_size:
                 m = _GEO_RE.match(g)
                 if not m:
@@ -706,81 +720,150 @@ class CaptchaDialog(MemoWindow):
         self.destroy()
 
 
-# ================= 实时进度（模态） =================
-class ProgressDialog(MemoWindow):
-    geo_key = "progress"
-    geo_keep_size = False
+# ================= 查询中的窗内覆盖层 =================
+class BusyOverlay:
+    """盖在主窗口内容区的查询进度层（替代原来的独立模态进度窗）。
 
-    def __init__(self, master, total, on_stop):
-        super().__init__(master)
-        self.title("处理中")
-        self.resizable(False, False)
-        self.transient(master)
+    * 不创建 Toplevel、不 grab、不抢任务栏 —— 不会出现"最小化后找不到"的问题
+    * 只用 Frame.place，随主窗口缩放；Win7 上也不依赖任何透明/合成特性
+    * 转圈用 Canvas 画弧线旋转，批量时进度条显示真实百分比
+    """
+
+    def __init__(self, app, total, on_stop, title="正在查询…"):
+        self.app = app
         self.total = max(1, int(total))
         self._on_stop = on_stop
         self._closed = False
+        self._angle = 0
+        self._job = None
+        pal = app._pal
 
-        f = ttk.Frame(self, style="Card.TFrame", padding=20)
-        f.pack(fill="both", expand=True)
+        try:
+            head_h = app.head.winfo_height()
+        except Exception:
+            head_h = 0
 
-        self.lbl_title = ttk.Label(f, text="正在查询…", style="H2.TLabel")
+        # 盖住标题栏以下的所有内容（标题与「访问官网」保持可见）
+        self.frame = tk.Frame(app, bg=pal["bg"], takefocus=1)
+        self.frame.place(x=0, y=head_h, relwidth=1, relheight=1, height=-head_h)
+        self.frame.lift()
+        self.frame.bind("<Key>", lambda e: "break")   # 吞掉键盘，避免误改输入框
+
+        # 用 tk.Frame 自绘卡片：边框、底色完全可控，不依赖 ttk 主题的边框细节
+        card = tk.Frame(self.frame, bg=pal["card"],
+                        highlightbackground=pal["line"], highlightthickness=1)
+        card.place(relx=0.5, rely=0.46, anchor="center")
+        inner = tk.Frame(card, bg=pal["card"], padx=26, pady=22)
+        inner.pack()
+
+        top = tk.Frame(inner, bg=pal["card"])
+        top.pack(fill="x")
+        self.cv = tk.Canvas(top, width=42, height=42, bg=pal["card"],
+                            highlightthickness=0, takefocus=0)
+        self.cv.pack(side="left", padx=(0, 16))
+        self.arc = self.cv.create_arc(5, 5, 37, 37, start=0, extent=270,
+                                      style="arc", width=4, outline=pal["accent"])
+
+        txt = tk.Frame(top, bg=pal["card"])
+        txt.pack(side="left", fill="x", expand=True)
+        self.lbl_title = tk.Label(txt, text=title, bg=pal["card"], fg=pal["text"],
+                                  font=("Microsoft YaHei UI", 13, "bold"), anchor="w")
         self.lbl_title.pack(anchor="w")
+        self.lbl_act = tk.Label(txt, text="0 / %d · 准备中…" % self.total,
+                                bg=pal["card"], fg=pal["sub"],
+                                font=("Microsoft YaHei UI", 9), anchor="w")
+        self.lbl_act.pack(anchor="w", pady=(3, 0))
 
-        self.bar = ttk.Progressbar(f, mode="determinate", maximum=self.total, length=400)
-        self.bar.pack(fill="x", pady=(14, 8))
+        try:
+            ttk.Style(self.app).configure("Busy.Horizontal.TProgressbar", thickness=6)
+        except Exception:
+            pass
+        self.bar = ttk.Progressbar(
+            inner, style="Busy.Horizontal.TProgressbar",
+            mode="indeterminate" if self.total <= 1 else "determinate",
+            maximum=self.total, length=430)
+        self.bar.pack(fill="x", pady=(18, 12))
+        if self.total <= 1:
+            self.bar.start(12)
 
-        row = ttk.Frame(f, style="Card.TFrame")
+        row = tk.Frame(inner, bg=pal["card"])
         row.pack(fill="x")
-        self.lbl_pct = ttk.Label(row, text="0%", style="AccentBig.TLabel")
-        self.lbl_pct.pack(side="left")
-        self.lbl_cnt = ttk.Label(row, text="0 / %d" % self.total, style="Sub.TLabel")
-        self.lbl_cnt.pack(side="right")
-
-        self.lbl_act = ttk.Label(f, text="准备中…", style="Sub.TLabel", width=52, anchor="w")
-        self.lbl_act.pack(anchor="w", pady=(12, 0))
-
-        self.lbl_stat = ttk.Label(f, text="成功 0   无结果 0   名称不合规 0   失败 0",
-                                  style="Sub.TLabel")
-        self.lbl_stat.pack(anchor="w", pady=(4, 0))
-
-        bb = ttk.Frame(f, style="Card.TFrame")
-        bb.pack(fill="x", pady=(18, 0))
-        self.btn_stop = ttk.Button(bb, text="停 止", command=self._stop)
+        self.lbl_stat = tk.Label(row, text="成功 0    无结果 0    名称不合规 0    失败 0",
+                                 bg=pal["card"], fg=pal["sub"],
+                                 font=("Microsoft YaHei UI", 9), anchor="w")
+        self.lbl_stat.pack(side="left")
+        self.btn_stop = ttk.Button(row, text="停 止", command=self._stop)
         self.btn_stop.pack(side="right")
 
-        self.protocol("WM_DELETE_WINDOW", lambda: None)
-        # 第一次居中到「主窗口」；之后回到上次的位置（主窗口位置本身也是记忆的）
-        place_memo_window(self, self.geo_key, master)
-        self.grab_set()
-        self.lift()
-        self.focus_force()
+        self._tick()
+        self.frame.focus_set()
 
+    # ---- 动画 ----
+    def _tick(self):
+        if self._closed:
+            return
+        try:
+            self._angle = (self._angle - 24) % 360
+            self.cv.itemconfigure(self.arc, start=self._angle)
+            self._job = self.frame.after(70, self._tick)
+        except Exception:
+            pass
+
+    # ---- 状态 ----
     def _stop(self):
-        self.btn_stop.config(state="disabled", text="正在停止…")
-        self.lbl_title.config(text="正在停止…")
-        self._on_stop()
+        try:
+            self.btn_stop.config(state="disabled", text="正在停止…")
+            self.lbl_title.config(text="正在停止…")
+        except Exception:
+            pass
+        try:
+            self._on_stop()
+        except Exception:
+            pass
 
     def update_state(self, done, total, activity, stats=None):
         if self._closed:
             return
-        self.total = max(1, int(total))
-        self.bar.config(maximum=self.total, value=done)
-        self.lbl_pct.config(text="%d%%" % int(done * 100 / self.total))
-        self.lbl_cnt.config(text="%d / %d" % (done, self.total))
-        if activity:
-            self.lbl_act.config(text="当前：%s" % activity)
-        if stats:
-            self.lbl_stat.config(text="成功 %d   无结果 %d   名称不合规 %d   失败 %d"
-                                 % (stats.get("ok", 0), stats.get("empty", 0),
-                                    stats.get("invalid", 0), stats.get("error", 0)))
-
-    def finish(self):
-        self._closed = True
         try:
-            self.grab_release()
+            self.total = max(1, int(total))
+            if self.total > 1:
+                self.bar.config(maximum=self.total, value=done)
+                head = "%d / %d（%d%%）" % (done, self.total,
+                                           int(done * 100 / self.total))
+            else:
+                head = "正在处理…" if done < 1 else "即将完成…"
+            if activity:
+                head += " · 当前：%s" % activity
+            self.lbl_act.config(text=head)
+            if stats:
+                self.lbl_stat.config(
+                    text="成功 %d    无结果 %d    名称不合规 %d    失败 %d"
+                         % (stats.get("ok", 0), stats.get("empty", 0),
+                            stats.get("invalid", 0), stats.get("error", 0)))
         except Exception:
             pass
-        self.destroy()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._job is not None:
+            try:
+                self.frame.after_cancel(self._job)
+            except Exception:
+                pass
+        try:
+            self.bar.stop()
+        except Exception:
+            pass
+        try:
+            self.frame.destroy()
+        except Exception:
+            pass
+        try:
+            self.app.ent.focus_set()
+        except Exception:
+            pass
 
 
 # ================= 机构详情（独立窗口 · 可复制） =================
@@ -1200,7 +1283,7 @@ class App(tk.Tk):
         self._log_open = False
         self._busy = False
         self._detail_stop = False
-        self.dlg_progress = None
+        self.overlay = None
         self._detail_wins = {}          # unitGuid -> 详情/加载窗口（同一机构只开一个）
         self._activity = ""
         self._row_by_line = {}
@@ -1267,6 +1350,9 @@ class App(tk.Tk):
             d["theme"] = sv_ttk.get_theme()
             d["mode"] = self.var_mode.get()
             d["token_file"] = self.var_token_file.get()
+            wins = d.get("windows")
+            if isinstance(wins, dict):
+                wins.pop("progress", None)   # 进度窗已改为窗内覆盖层
             save_ui_state(d)
             self._ui = d
         except Exception:
@@ -1356,6 +1442,7 @@ class App(tk.Tk):
 
         head = ttk.Frame(self, padding=(20, 14, 20, 10))
         head.pack(fill="x")
+        self.head = head
         ttk.Label(head, text="全国医疗机构查询", style="H1.TLabel").pack(side="left")
         # 「访问官网」按钮：用系统默认浏览器打开官网查询页
         self.btn_site = ttk.Button(head, text="访问官网", style="Accent.TButton",
@@ -1828,7 +1915,7 @@ class App(tk.Tk):
                              solve_tries=self.var_tries.get(),
                              fetch_detail=False,
                              allow_manual=self.var_manual.get())
-        self.dlg_progress = ProgressDialog(self, len(tasks), self._stop)
+        self.overlay = BusyOverlay(self, len(tasks), self._stop)
         self._refresh_ip()
         self._log("开始查询 %d 条（%s 模式，%d 并发）"
                   % (len(tasks), "直连" if self.var_mode.get() == "xff" else "代理池",
@@ -1919,20 +2006,9 @@ class App(tk.Tk):
         box = {"ev": threading.Event(), "res": None}
 
         def show():
-            if self.dlg_progress is not None:
-                try:
-                    self.dlg_progress.grab_release()
-                except Exception:
-                    pass
             dlg = CaptchaDialog(self, png_bytes, wordlist)
             self.wait_window(dlg)
             box["res"] = dlg.result
-            if self.dlg_progress is not None:
-                try:
-                    self.dlg_progress.grab_set()
-                    self.dlg_progress.lift()
-                except Exception:
-                    pass
             box["ev"].set()
 
         self.after(0, show)
@@ -1977,9 +2053,9 @@ class App(tk.Tk):
                     self._busy = False
                     self.btn.config(state="normal")
                     self.var_status.set("完成")
-                    if self.dlg_progress is not None:
-                        self.dlg_progress.finish()
-                        self.dlg_progress = None
+                    if self.overlay is not None:
+                        self.overlay.close()
+                        self.overlay = None
                     self._log("=== 全部结束 ===")
                     self._prog()
                     self._refresh_ip()
@@ -2004,8 +2080,8 @@ class App(tk.Tk):
         s = self.engine.stats
         self.var_status.set("已完成 %d/%d   成功 %d   无结果 %d   名称不合规 %d   失败 %d"
                             % (d, n, s["ok"], s["empty"], s["invalid"], s["error"]))
-        if self.dlg_progress is not None:
-            self.dlg_progress.update_state(d, n, self._activity, s)
+        if self.overlay is not None:
+            self.overlay.update_state(d, n, self._activity, s)
 
     def _add(self, t: Task):
         if t.status == "ok":
@@ -2113,16 +2189,18 @@ class App(tk.Tk):
             messagebox.showerror("错误", "导出失败：%s" % e, parent=self)
 
     def _fetch_all_details(self, data):
-        """导出前补齐详情（带模态进度）。"""
+        """导出前补齐详情（用窗内覆盖层显示进度）。"""
         todo = [r for r in data if r.get("unitGuid") and not r.get("detail")]
         if not todo:
             return True
         self._detail_stop = False
-        dlg = ProgressDialog(self, len(todo), self._request_detail_stop)
-        dlg.lbl_title.config(text="正在抓取机构详情…")
+        ov = BusyOverlay(self, len(todo), self._request_detail_stop,
+                         title="正在抓取机构详情…")
+        self.overlay = ov
         done = [0]
         failed = [0]
         lock = threading.Lock()
+        finished = tk.BooleanVar(master=self, value=False)
 
         def work():
             from concurrent.futures import ThreadPoolExecutor
@@ -2149,16 +2227,21 @@ class App(tk.Tk):
                         failed[0] += 1
                     n, f = done[0], failed[0]
                     nm = r.get("unitName", "")[:22]
-                safe(lambda: dlg.update_state(
+                safe(lambda: ov.update_state(
                     n, len(todo), "抓取详情 - %s%s" % (nm, "" if not f else "  (失败 %d)" % f)))
                 safe(self._refresh_ip)
 
             with ThreadPoolExecutor(max_workers=min(6, len(todo))) as ex:
                 list(ex.map(one, todo))
-            safe(dlg.finish)
+            safe(ov.close)
+            safe(lambda: finished.set(True))
 
         threading.Thread(target=work, daemon=True).start()
-        self.wait_window(dlg)
+        try:
+            self.wait_variable(finished)      # 保持事件循环，转圈不卡
+        except Exception:
+            pass
+        self.overlay = None
         return True
 
     def _request_detail_stop(self):
