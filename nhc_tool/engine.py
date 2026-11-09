@@ -21,7 +21,7 @@ from .client import SiteClient, SiteResult
 # ---------------- 任务 / 结果 ----------------
 class Task:
     __slots__ = ("province_code", "province_name", "keyword", "status", "msg",
-                 "units", "ip", "tries", "ts", "detail")
+                 "units", "ip", "tries", "ts", "detail", "total")
 
     def __init__(self, province_code, province_name, keyword):
         self.province_code = province_code
@@ -34,6 +34,7 @@ class Task:
         self.tries = 0
         self.ts = ""
         self.detail = {}
+        self.total = 0               # 官网报告的匹配总数（接口每次只回前 20 条）
 
 
 class State:
@@ -188,8 +189,11 @@ class Engine:
             d = res.data or {}
             task.units = d.get("unitInfoList") or []
             task.status = "ok" if task.units else "empty"
-            task.msg = ("共 %s 条，返回 %s 条"
-                        % ((d.get("summary") or {}).get("total", 0), len(task.units)))
+            try:
+                task.total = int((d.get("summary") or {}).get("total") or 0)
+            except Exception:
+                task.total = 0
+            task.msg = ("共 %s 条，返回 %s 条" % (task.total, len(task.units)))
             task.ts = time.strftime("%H:%M:%S")
             if self.fetch_detail and task.units:
                 self._fetch_details(cli, task)

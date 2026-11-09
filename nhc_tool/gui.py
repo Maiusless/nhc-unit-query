@@ -17,6 +17,7 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
+import zlib
 from tkinter import filedialog, messagebox, ttk
 
 from . import captcha as CAP
@@ -155,6 +156,99 @@ def _cell(v, key=""):
     if v is None or v == "":
         return ""
     return _fmt(v, key)
+
+
+# 诊疗科目配色：同一科室在任何机构里都用同一个颜色（crc32 取模，跨进程稳定），
+# 让「内科 / 外科 / 检验科」在不同记录间形成固定的视觉锚点。
+SUBJECT_COLORS = {
+    "light": ("#0b63b8", "#0d7a6a", "#7a3ea8", "#a0521a", "#1f6f3d", "#8a1f4b"),
+    "dark": ("#7bb8ff", "#54d2b4", "#c9a6ff", "#ffb473", "#8be0a8", "#ff9fc6"),
+}
+
+
+def _split_outside_brackets(s, seps):
+    """按 seps 拆分，但括号内的分隔符不拆（"内科（A、B）" 保持完整）。"""
+    parts, buf, depth = [], [], 0
+    for ch in s:
+        if ch in "(（":
+            depth += 1
+        elif ch in ")）":
+            depth = max(0, depth - 1)
+        if depth == 0 and ch in seps:
+            p = "".join(buf).strip()
+            if p:
+                parts.append(p)
+            buf = []
+            continue
+        buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def split_subjects(text):
+    """把官网的诊疗科目串拆成 [(科室名, [子专业...]), ...]。
+
+    官网实际格式（实测）：
+        预防保健科 | 内科;呼吸内科专业;消化内科专业 | 眼科 | ... ******
+    即「科室之间用 | 分隔，科室内用 ; 分隔主科与子专业」，末尾带一串 *。
+    也兼容「预防保健科、全科医疗科」这种纯顿号写法，以及括号 / 冒号写法。
+
+    纯展示用：复制与导出仍保留官网原文，不做任何改写。
+    """
+    s = "" if text is None else str(text).strip()
+    if not s or s in ("—", "-", "/", "无"):
+        return []
+    s = re.sub(r"\*{2,}\s*$", "", s).strip()     # 去掉末尾的 ******
+
+    if "|" in s:
+        parts = [p.strip() for p in s.split("|")]
+    elif re.search(r"[、，,\n\r]", s):
+        parts = _split_outside_brackets(s, "、，,\n\r")
+    else:
+        parts = [s]
+
+    # 「内科：A、B、外科：C」这种冒号写法：冒号后直到下一个冒号前的都算子专业
+    if "|" not in s and any("：" in p for p in parts):
+        merged = []
+        for p in parts:
+            if "：" in p:
+                a, b = p.split("：", 1)
+                row = [a.strip()]
+                if b.strip():
+                    row.append(b.strip())
+                merged.append(row)
+            elif merged:
+                merged[-1].append(p)
+            else:
+                merged.append([p])
+        parts = [";".join(x) for x in merged]
+
+    out = []
+    for p in parts:
+        p = p.strip().strip("*").strip()
+        if not p:
+            continue
+        # 段内：第一个 ; 之前是科室名，之后都是它的子专业
+        segs = [x.strip() for x in re.split(r"[；;]", p) if x.strip()]
+        if not segs:
+            continue
+        name, subs = segs[0], segs[1:]
+
+        if not subs:
+            m = re.match(r"^(.*?)[（(](.+)[)）]\s*$", name)
+            if m and m.group(1).strip():
+                name = m.group(1).strip()
+                subs = [x.strip() for x in re.split(r"[、，,；;]", m.group(2))
+                        if x.strip()]
+        if not subs and "：" in name:
+            a, b = name.split("：", 1)
+            if a.strip() and b.strip():
+                name = a.strip()
+                subs = [x.strip() for x in re.split(r"[、，,；;]", b) if x.strip()]
+        out.append((name, subs))
+    return out
 
 
 def make_readonly(txt: tk.Text):
@@ -300,8 +394,126 @@ def valid_geometry(geo, minsize, screen):
     return "%dx%d+%d+%d" % (w, h, x, y)
 
 
+# ---------- 弹窗位置记忆 ----------
+# 规则：某个弹窗第一次出现时居中；之后每次出现在上次关闭时的位置
+#（详情窗允许缩放，所以尺寸也一起记住）。
+def window_geometry(key):
+    try:
+        wins = load_ui_state().get("windows")
+        if isinstance(wins, dict):
+            v = wins.get(key)
+            return v if isinstance(v, str) else None
+    except Exception:
+        pass
+    return None
+
+
+def remember_window(key, geo):
+    """写回 ui.json 里该弹窗的几何。
+
+    每次重新读盘再写，避免与主窗口 _save_ui 的缓存互相覆盖。
+    """
+    try:
+        d = load_ui_state()
+        wins = d.get("windows")
+        if not isinstance(wins, dict):
+            wins = {}
+        wins[key] = geo
+        d["windows"] = wins
+        save_ui_state(d)
+    except Exception:
+        pass
+
+
+_POS_RE = re.compile(r"^([+-]\d+)([+-]\d+)$")
+
+
+def place_memo_window(win, key, parent=None, size=None, keep_size=True,
+                      minsize=(200, 120)):
+    """第一次居中，之后回到上次位置（keep_size=False 时只记位置不记尺寸）。"""
+    try:
+        win.update_idletasks()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        saved = window_geometry(key)
+        geo = valid_geometry(saved, minsize, (sw, sh))
+        if not geo and saved:
+            # 只存了位置（尺寸固定的弹窗）：用当前自然尺寸补全
+            m = _POS_RE.match(saved)
+            if m:
+                w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+                x, y = int(m.group(1)), int(m.group(2))
+                x = max(0, min(x, max(0, sw - w)))
+                y = max(0, min(y, max(0, sh - h)))
+                geo = "%dx%d+%d+%d" % (w, h, x, y)
+        if geo:
+            if not keep_size:
+                m = _GEO_RE.match(geo)
+                if m:
+                    geo = "%s%s" % (m.group(3), m.group(4))
+            win.geometry(geo)
+            return True
+    except Exception:
+        pass
+    center_window(win, parent, size=size)
+    return False
+
+
+def place_inside_remembered(win, key, parent=None):
+    """把一个小窗摆在某个已记忆窗口的中心（没有记录时退回居中）。
+
+    详情加载窗用：让它从「详情窗将要出现的位置」冒出，避免先闪一下屏幕中央。
+    """
+    try:
+        win.update_idletasks()
+        m = _GEO_RE.match(window_geometry(key) or "")
+        if m:
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+            x = int(m.group(3)) + (int(m.group(1)) - w) // 2
+            y = int(m.group(4)) + (int(m.group(2)) - h) // 2
+            x = max(0, min(x, max(0, sw - w)))
+            y = max(0, min(y, max(0, sh - h)))
+            win.geometry("%dx%d+%d+%d" % (w, h, x, y))
+            return True
+    except Exception:
+        pass
+    center_window(win, parent)
+    return False
+
+
+class MemoWindow(tk.Toplevel):
+    """关闭时把位置（可含尺寸）写回 ui.json 的 Toplevel。"""
+
+    geo_key = None
+    geo_keep_size = True
+
+    def _save_geo(self):
+        if not self.geo_key:
+            return
+        try:
+            st = self.state()
+            if st in ("iconic", "withdrawn"):
+                return                     # 最小化状态下不覆盖上次的位置
+            g = self.winfo_geometry()
+            if not self.geo_keep_size:
+                m = _GEO_RE.match(g)
+                if not m:
+                    return
+                g = "%s%s" % (m.group(3), m.group(4))
+            remember_window(self.geo_key, g)
+        except Exception:
+            pass
+
+    def destroy(self):
+        self._save_geo()
+        super().destroy()
+
+
 # ================= 人工验证码 =================
-class CaptchaDialog(tk.Toplevel):
+class CaptchaDialog(MemoWindow):
+    geo_key = "captcha"
+    geo_keep_size = False
+
     def __init__(self, master, png_bytes, wordlist):
         super().__init__(master)
         self.title("验证码")
@@ -337,7 +549,7 @@ class CaptchaDialog(tk.Toplevel):
         ttk.Button(bar, text="放弃本次", command=self._cancel).pack(side="left", padx=8)
 
         self.protocol("WM_DELETE_WINDOW", self._cancel)
-        center_window(self, master)
+        place_memo_window(self, self.geo_key, master)
         self.grab_set()
         self.lift()
         self.focus_force()
@@ -371,7 +583,10 @@ class CaptchaDialog(tk.Toplevel):
 
 
 # ================= 实时进度（模态） =================
-class ProgressDialog(tk.Toplevel):
+class ProgressDialog(MemoWindow):
+    geo_key = "progress"
+    geo_keep_size = False
+
     def __init__(self, master, total, on_stop):
         super().__init__(master)
         self.title("处理中")
@@ -410,8 +625,8 @@ class ProgressDialog(tk.Toplevel):
         self.btn_stop.pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", lambda: None)
-        # 居中到「主窗口」而不是屏幕：主窗口的位置是被记忆的，按屏幕居中会与之冲突
-        center_window(self, master)
+        # 第一次居中到「主窗口」；之后回到上次的位置（主窗口位置本身也是记忆的）
+        place_memo_window(self, self.geo_key, master)
         self.grab_set()
         self.lift()
         self.focus_force()
@@ -444,31 +659,72 @@ class ProgressDialog(tk.Toplevel):
         self.destroy()
 
 
-# ================= 机构详情（可复制） =================
-class DetailDialog(tk.Toplevel):
-    def __init__(self, master, name, detail):
+# ================= 机构详情（独立窗口 · 可复制） =================
+class DetailDialog(MemoWindow):
+    """独立的机构详情窗口。
+
+    刻意**不设 transient、不 grab_set**：
+      * transient 子窗不会出现在任务栏，主窗口最小化时会被一起隐藏，
+        恢复后可能既看不见、又仍握着 grab —— 整个程序就像卡死一样；
+      * 独立窗口有自己的最小化 / 最大化 / 关闭按钮，可以和主窗口各管各的，
+        也便于同时开两个机构的详情做对照。
+    """
+
+    geo_key = "detail"
+    geo_keep_size = True
+
+    def __init__(self, master, name, detail, cascade=0):
         super().__init__(master)
-        self.title("机构详情")
-        self.minsize(600, 460)
-        self.transient(master)
         self._detail = detail or {}
         self._master = master
+        self._base_title = name or self._detail.get("unitName", "") or "机构详情"
+        short = self._base_title if len(self._base_title) <= 28 \
+            else self._base_title[:27] + "…"
+        self.title("机构详情 - %s" % short)
+        self.minsize(620, 460)
 
-        head = ttk.Frame(self, style="Card.TFrame", padding=(20, 18, 20, 12))
+        pal = self._pal()
+        colors = SUBJECT_COLORS[self._theme_name()]
+
+        # ---- 顶部：机构名称（可选中 / Ctrl+C / 右键 / 一键复制）----
+        head = ttk.Frame(self, style="Card.TFrame", padding=(20, 16, 20, 10))
         head.pack(fill="x")
-        ttk.Label(head, text=name or self._detail.get("unitName", ""),
-                  style="H2.TLabel", wraplength=680, justify="left").pack(anchor="w")
-        ttk.Separator(self).pack(fill="x")
+        row = ttk.Frame(head, style="Card.TFrame")
+        row.pack(fill="x")
+        self._head, self._row = head, row
 
+        self.name_txt = tk.Text(row, wrap="word", relief="flat", borderwidth=0,
+                                height=1, font=("Microsoft YaHei UI", 15, "bold"),
+                                cursor="xterm", bg=pal["card"], fg=pal["text"],
+                                padx=0, pady=0, spacing1=0, spacing3=0,
+                                highlightthickness=0, insertwidth=0,
+                                selectbackground=pal["sel"],
+                                selectforeground=pal["selfg"])
+        self.name_txt.insert("1.0", self._base_title)
+        make_readonly(self.name_txt)
+        self._build_name_menu()
+
+        # 先 pack 右侧按钮：否则先 pack 的 expand 文本会把它挤成 0 宽
+        self.btn_name = ttk.Label(row, text="复制名称", style="Link.TLabel",
+                                  cursor="hand2")
+        self.btn_name.pack(side="right", padx=(12, 0), anchor="n")
+        self.btn_name.bind("<Button-1>", lambda e: self._copy_name())
+        self.name_txt.pack(side="left", fill="x", expand=True)
+
+        ttk.Separator(self).pack(fill="x")
+        self.name_txt.bind("<Configure>", self._fit_name_height)
+        self.after_idle(self._fit_name_height)
+
+        # ---- 正文 ----
         outer = ttk.Frame(self)
         outer.pack(fill="both", expand=True)
-        pal = self._pal()
         self.txt = tk.Text(outer, wrap="word", relief="flat", borderwidth=0,
                            font=("Microsoft YaHei UI", 10), cursor="xterm",
                            bg=pal["card"], fg=pal["text"],
                            padx=18, pady=12, spacing1=2, spacing3=4,
                            tabs=(96,), selectbackground=pal["sel"],
-                           selectforeground=pal["selfg"], insertwidth=0)
+                           selectforeground=pal["selfg"], insertwidth=0,
+                           highlightthickness=0)
         vsb = ttk.Scrollbar(outer, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
@@ -481,9 +737,23 @@ class DetailDialog(tk.Toplevel):
         self.txt.tag_configure("val", font=("Microsoft YaHei UI", 10),
                                lmargin1=0, lmargin2=96)
         self.txt.tag_configure("sep", foreground=pal["line"])
+        # 诊疗科目：每个科一行，彩色色块 + 加粗放大的科名，子专业缩进灰字
+        for i, c in enumerate(colors):
+            self.txt.tag_configure("sc%d" % i, foreground=c)
+        self.txt.tag_configure("sname", font=("Microsoft YaHei UI", 11, "bold"),
+                               spacing1=6, spacing3=1)
+        self.txt.tag_configure("ssub", font=("Microsoft YaHei UI", 9),
+                               foreground=pal["sub"], lmargin1=26, lmargin2=26,
+                               spacing3=6)
+        self.txt.tag_configure("scount", font=("Microsoft YaHei UI", 9),
+                               foreground=pal["sub"], spacing3=2)
 
         shown = set()
         for gname, fields in detail_groups(self._detail.get("unitType")):
+            if len(fields) == 1 and fields[0][0] == "unitSubjectName":
+                shown.add("unitSubjectName")
+                self._insert_subjects(gname, self._detail.get("unitSubjectName"))
+                continue
             self.txt.insert("end", gname + "\n", "grp")
             for key, label in fields:
                 # 官网对空值字段同样显示标签，这里保持一致（空值显示为 —）
@@ -503,28 +773,125 @@ class DetailDialog(tk.Toplevel):
         if not shown and not rest:
             self.txt.insert("end", "（该机构暂无更多详情字段）\n", "val")
         make_readonly(self.txt)
-        add_copy_menu(self.txt, master)
+        add_copy_menu(self.txt, self)
 
         foot = ttk.Frame(self, padding=(20, 12))
         foot.pack(fill="x")
-        ttk.Label(foot, text="可直接拖动鼠标选中，Ctrl+C 复制",
+        ttk.Label(foot, text="可拖动选中复制；科目按科分色，复制内容仍为官网原文",
                   style="Sub.TLabel").pack(side="left")
         ttk.Button(foot, text="复制全部", command=self._copy).pack(side="right")
         ttk.Button(foot, text="关闭", style="Accent.TButton",
                    command=self.destroy).pack(side="right", padx=8)
 
-        center_window(self, master, size=(760, 660))
-        self.grab_set()
+        place_memo_window(self, self.geo_key, master, size=(780, 680),
+                          keep_size=True, minsize=(620, 460))
+        if cascade:
+            # 等居中的装饰补偿（25/170ms）跑完再错位，否则会被它拽回原位
+            self.after(260, lambda: self._cascade(cascade))
         self.lift()
         self.focus_force()
         self.txt.focus_set()
 
-    def _pal(self):
+    # ---- 名称区 ----
+    def _fit_name_height(self, _ev=None):
+        """名称有多长就占几行（最多 3 行），不靠固定高度硬扛。"""
+        try:
+            n = self.name_txt.count("1.0", "end-1c", "displaylines")
+            if isinstance(n, (tuple, list)):
+                n = n[0] if n else 1
+            n = max(1, min(int(n or 1), 3))
+            if int(self.name_txt.cget("height")) != n:
+                self.name_txt.configure(height=n)
+        except Exception:
+            pass
+
+    def _build_name_menu(self):
+        m = tk.Menu(self.name_txt, tearoff=0)
+        m.add_command(label="复制名称", command=self._copy_name)
+        m.add_command(label="复制选中",
+                      command=lambda: self.name_txt.event_generate("<<Copy>>"))
+        m.add_separator()
+        m.add_command(label="全选",
+                      command=lambda: self.name_txt.tag_add("sel", "1.0", "end-1c"))
+        self.name_txt.bind("<Button-3>", lambda e: m.tk_popup(e.x_root, e.y_root))
+
+    def _copy_name(self):
+        txt = self.name_txt.get("1.0", "end-1c").strip()
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+            self.btn_name.config(text="已复制 ✓")
+            self.after(1500, self._reset_name_btn)
+        except Exception:
+            pass
+
+    def _reset_name_btn(self):
+        try:
+            if self.winfo_exists():
+                self.btn_name.config(text="复制名称")
+        except Exception:
+            pass
+
+    def _cascade(self, n):
+        try:
+            x, y = self.winfo_x(), self.winfo_y()
+            self.geometry("+%d+%d" % (x + 26 * n, y + 26 * n))
+        except Exception:
+            pass
+
+    # ---- 主题 / 配色 ----
+    def restyle(self):
+        """主窗口切主题时，已开着的详情窗跟着换色（它是独立窗口，不会自动重绘）。"""
+        pal, colors = self._pal(), SUBJECT_COLORS[self._theme_name()]
+        try:
+            self.name_txt.configure(bg=pal["card"], fg=pal["text"],
+                                    selectbackground=pal["sel"],
+                                    selectforeground=pal["selfg"])
+            self.txt.configure(bg=pal["card"], fg=pal["text"],
+                               selectbackground=pal["sel"],
+                               selectforeground=pal["selfg"])
+            self.txt.tag_configure("grp", foreground=pal["accent"])
+            self.txt.tag_configure("lbl", foreground=pal["sub"])
+            self.txt.tag_configure("sep", foreground=pal["line"])
+            self.txt.tag_configure("ssub", foreground=pal["sub"])
+            self.txt.tag_configure("scount", foreground=pal["sub"])
+            for i, c in enumerate(colors):
+                self.txt.tag_configure("sc%d" % i, foreground=c)
+        except Exception:
+            pass
+
+    def _theme_name(self):
         try:
             import sv_ttk
-            return PALETTE[sv_ttk.get_theme()]
+            t = sv_ttk.get_theme()
+            return t if t in SUBJECT_COLORS else "light"
         except Exception:
-            return PALETTE["light"]
+            return "light"
+
+    def _pal(self):
+        return PALETTE[self._theme_name()]
+
+    # ---- 诊疗科目 ----
+    def _insert_subjects(self, title, raw):
+        items = split_subjects(raw)
+        self.txt.insert("end", title, "grp")
+        if not items:
+            self.txt.insert("end", "\n", "grp")
+            self.txt.insert("end", _fmt(raw) + "\n", "val")
+            return
+        self.txt.insert("end", "    共 %d 项\n" % len(items), "scount")
+        n = len(SUBJECT_COLORS["light"])
+        prev = -1
+        for name, subs in items:
+            i = zlib.crc32(name.encode("utf-8")) % n
+            if i == prev:                  # 相邻两科不撞色
+                i = (i + 1) % n
+            prev = i
+            tag = "sc%d" % i
+            self.txt.insert("end", "▍ ", tag)
+            self.txt.insert("end", name + "\n", ("sname", tag))
+            if subs:
+                self.txt.insert("end", "    " + " · ".join(subs) + "\n", "ssub")
 
     def _copy(self):
         """复制内容与窗口显示保持一致（含"官网未展示"的补充字段）。"""
@@ -547,7 +914,10 @@ class DetailDialog(tk.Toplevel):
 
 
 # ================= 设置 =================
-class SettingsDialog(tk.Toplevel):
+class SettingsDialog(MemoWindow):
+    geo_key = "settings"
+    geo_keep_size = False
+
     def __init__(self, master, app):
         super().__init__(master)
         self.title("设置")
@@ -628,7 +998,7 @@ class SettingsDialog(tk.Toplevel):
                    command=self.destroy).pack(anchor="e")
 
         self._sync_token_row()
-        center_window(self, master)
+        place_memo_window(self, self.geo_key, master)
         self.grab_set()
         self.lift()
         self.focus_force()
@@ -682,10 +1052,12 @@ class App(tk.Tk):
         self._busy = False
         self._detail_stop = False
         self.dlg_progress = None
-        self._detail_win = None
+        self._detail_wins = {}          # unitGuid -> 详情/加载窗口（同一机构只开一个）
         self._activity = ""
         self._row_by_line = {}
         self._line_no = 0
+        self._unit_count = 0            # 实际展示的机构条数
+        self._match_total = 0           # 官网报告的匹配总数（接口每次只回前 20 条）
 
         self.var_prov = tk.StringVar(value=DEFAULT_PROV)
         self.var_kw = tk.StringVar()
@@ -739,12 +1111,15 @@ class App(tk.Tk):
     def _save_ui(self):
         try:
             import sv_ttk
-            d = dict(self._ui)
+            # 先读盘再合并：各弹窗也会往 ui.json 写自己的位置，
+            # 直接用启动时的缓存会把这些记录覆盖掉。
+            d = load_ui_state()
             d["geometry"] = self.winfo_geometry()
             d["theme"] = sv_ttk.get_theme()
             d["mode"] = self.var_mode.get()
             d["token_file"] = self.var_token_file.get()
             save_ui_state(d)
+            self._ui = d
         except Exception:
             pass
 
@@ -769,6 +1144,12 @@ class App(tk.Tk):
             self._pal = PALETTE[sv_ttk.get_theme()]
             self._styles()
             self._repaint()
+            for w in list(self._detail_wins.values()):
+                try:
+                    if w.winfo_exists() and hasattr(w, "restyle"):
+                        w.restyle()
+                except Exception:
+                    pass
         except Exception as e:
             self._log("主题切换失败：%s" % type(e).__name__)
 
@@ -816,6 +1197,8 @@ class App(tk.Tk):
         s.configure("Field.TLabel", font=("Microsoft YaHei UI", 9), foreground=p["sub"])
         s.configure("Value.TLabel", font=("Microsoft YaHei UI", 10))
         s.configure("Link.TLabel", font=("Microsoft YaHei UI", 9), foreground=p["accent"])
+        s.configure("Whisper.TLabel", font=("Microsoft YaHei UI", 9),
+                    foreground="#9b9b9b" if p["bg"] == PALETTE["light"]["bg"] else "#6e6e6e")
         s.configure("TButton", font=("Microsoft YaHei UI", 9))
 
     # ---------- 布局 ----------
@@ -853,15 +1236,16 @@ class App(tk.Tk):
                               width=12, command=self._search)
         self.btn.grid(row=1, column=2, sticky="ns", pady=(4, 0))
 
-        ttk.Label(card, text="注：至少输入机构名称中连续的 4 个字即可模糊查询。"
-                             "例如“中国医学科学院北京协和医院”，输入“协和医院”即可。",
+        ttk.Label(card, text="注：至少输入机构名称中连续的 2 个字即可模糊查询，"
+                             "例如“中国医学科学院北京协和医院”，输入“协和”即可；"
+                             "字数越少结果越多，官网接口每次最多返回前 20 条。",
                   style="Sub.TLabel").grid(row=2, column=0, columnspan=3,
                                            sticky="w", pady=(10, 0))
 
         bar = ttk.Frame(self, padding=(20, 10, 20, 6))
         bar.pack(fill="x")
         self.bar = bar
-        ttk.Label(bar, textvariable=self.var_count, style="H2.TLabel").pack(side="left")
+        # 先排右侧按钮：窗口变窄时被压缩的是左侧文字，而不是把按钮挤没
         ttk.Button(bar, text="导出 Excel", style="Accent.TButton",
                    command=lambda: self._export("xlsx")).pack(side="right")
         ttk.Button(bar, text="导出 CSV",
@@ -871,9 +1255,11 @@ class App(tk.Tk):
         ttk.Button(bar, text="设置",
                    command=lambda: SettingsDialog(self, self)).pack(side="right")
         ttk.Button(bar, text="主题", command=self._toggle_theme).pack(side="right", padx=6)
+        self.lbl_count = ttk.Label(bar, textvariable=self.var_count, style="H2.TLabel")
+        self.lbl_count.pack(side="left")
 
         self.batch = ttk.Frame(self, style="Card.TFrame", padding=14)
-        ttk.Label(self.batch, text="批量查询：每行一个医疗机构名称（至少 4 个字）",
+        ttk.Label(self.batch, text="批量查询：每行一个医疗机构名称（至少 2 个字）",
                   style="Sub.TLabel").pack(anchor="w")
         wrapb = ttk.Frame(self.batch, style="Card.TFrame")
         wrapb.pack(fill="both", expand=True, pady=(6, 8))
@@ -916,6 +1302,10 @@ class App(tk.Tk):
         ttk.Label(self.st, textvariable=self.var_status, style="Sub.TLabel").pack(side="left")
         ttk.Label(self.st, textvariable=self.var_ip, style="Sub.TLabel").pack(side="right")
         ttk.Button(self.st, text="日志", command=self._toggle_log).pack(side="right", padx=(8, 14))
+        # 「日志」按钮左边的一行小字（刻意做得不起眼）
+        self.lbl_whisper = ttk.Label(self.st, text="今天也要准时下班哦🥰🥰~",
+                                     style="Whisper.TLabel")
+        self.lbl_whisper.pack(side="right", padx=(0, 12))
 
     def _build_table(self):
         """结果表：用 Text 实现——支持拖动选中与 Ctrl+C 复制，且可做蓝色链接。"""
@@ -1077,39 +1467,57 @@ class App(tk.Tk):
             pass
 
     # ---------- 详情 ----------
+    def _live_detail(self, guid):
+        """该机构已有窗口就把它恢复出来（最小化也能还原），没有则返回 None。"""
+        win = self._detail_wins.get(guid)
+        if win is None:
+            return None
+        try:
+            if not win.winfo_exists():
+                raise tk.TclError("gone")
+            if win.state() in ("iconic", "withdrawn"):
+                win.deiconify()          # 关键：lift() 对最小化的窗口无效
+            win.lift()
+            win.focus_force()
+            return win
+        except Exception:
+            self._detail_wins.pop(guid, None)
+            return None
+
     def _open_detail(self, row):
         if self._busy:
             return
-        # 同一时刻只允许一个详情/加载窗口，防止快速连点堆出大量窗口
-        cur = self._detail_win
-        if cur is not None:
-            try:
-                if cur.winfo_exists():
-                    cur.lift()
-                    cur.focus_force()
-                    return
-            except Exception:
-                pass
-            self._detail_win = None
-
         name = row.get("unitName", "")
         guid, rt = row.get("unitGuid", ""), row.get("reqTime", "")
         if not guid:
             messagebox.showinfo("提示", "该行没有可查看的机构详情", parent=self)
             return
-        if row.get("detail"):
-            self._detail_win = self._show_detail(name, row["detail"])
+        if self._live_detail(guid) is not None:
             return
 
+        if row.get("detail"):
+            self._show_detail(name, row["detail"], guid)
+            return
+
+        # 加载窗同样是独立窗口：不 transient、不抢 grab，
+        # 免得主窗口最小化后整个程序被一个看不见的模态窗卡住。
         win = tk.Toplevel(self)
-        self._detail_win = win
-        win.title("加载中")
+        self._detail_wins[guid] = win
+        win.title("机构详情 - 正在加载")
         win.resizable(False, False)
-        win.transient(self)
         ttk.Label(win, text="正在获取机构详情…\n（票据过期时会自动重新查询，请稍候）",
                   padding=26, justify="center").pack()
-        center_window(win, self)
-        win.grab_set()
+        place_inside_remembered(win, "detail", self)
+
+        def cancel():
+            self._detail_wins.pop(guid, None)
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(win, text="取消", command=cancel).pack(pady=(0, 14))
+        win.protocol("WM_DELETE_WINDOW", cancel)
 
         def run():
             try:
@@ -1118,18 +1526,20 @@ class App(tk.Tk):
                                             row.get("keyword", ""))
             except Exception:
                 d = None
-            self.after(0, lambda: done(d))
+            try:
+                self.after(0, lambda: done(d))
+            except Exception:
+                pass                # 主窗口已关闭
 
         def done(d):
-            try:
-                win.grab_release()
-            except Exception:
-                pass
+            # 用户中途点了「取消」/ 关了窗口：不再弹详情
+            if self._detail_wins.get(guid) is not win:
+                return
+            self._detail_wins.pop(guid, None)
             try:
                 win.destroy()
             except Exception:
-                return          # 主窗口已关闭
-            self._detail_win = None
+                return
             self._refresh_ip()
             if not d:
                 messagebox.showwarning(
@@ -1139,14 +1549,27 @@ class App(tk.Tk):
                     parent=self)
                 return
             row["detail"] = d
-            self._detail_win = self._show_detail(name, d)
+            self._show_detail(name, d, guid)
 
         threading.Thread(target=run, daemon=True).start()
 
-    def _show_detail(self, name, detail):
-        dlg = DetailDialog(self, name, detail)
-        dlg.bind("<Destroy>", lambda e: setattr(self, "_detail_win", None)
-                 if e.widget is dlg else None)
+    def _show_detail(self, name, detail, guid=""):
+        # 已开着别的机构详情时错开一点，避免新窗完全盖住旧窗
+        n = 0
+        for w in list(self._detail_wins.values()):
+            try:
+                if w.winfo_exists():
+                    n += 1
+            except Exception:
+                pass
+        dlg = DetailDialog(self, name, detail, cascade=min(n, 6))
+        self._detail_wins[guid] = dlg
+
+        def gone(e):
+            if e.widget is dlg and self._detail_wins.get(guid) is dlg:
+                self._detail_wins.pop(guid, None)
+
+        dlg.bind("<Destroy>", gone, add="+")
         return dlg
 
     # ---------- 数据 ----------
@@ -1208,8 +1631,8 @@ class App(tk.Tk):
         if not kw:
             messagebox.showwarning("提示", "请输入医疗机构名称", parent=self)
             return
-        if len(kw) < 4:
-            messagebox.showwarning("提示", "医疗机构名称至少需要连续的 4 个字", parent=self)
+        if len(kw) < 2:
+            messagebox.showwarning("提示", "医疗机构名称至少需要连续的 2 个字", parent=self)
             return
         self._clear()
         pc, pn = self._prov()
@@ -1223,9 +1646,9 @@ class App(tk.Tk):
         if not kws:
             messagebox.showwarning("提示", "请在批量框里输入名称（每行一个）", parent=self)
             return
-        bad = [k for k in kws if len(k) < 4]
+        bad = [k for k in kws if len(k) < 2]
         if bad:
-            messagebox.showwarning("提示", "以下名称少于 4 个字：\n" + "、".join(bad[:8]),
+            messagebox.showwarning("提示", "以下名称少于 2 个字：\n" + "、".join(bad[:8]),
                                    parent=self)
             return
         self._clear()
@@ -1297,6 +1720,8 @@ class App(tk.Tk):
             return
         self._clear_table()
         self.rows = []
+        self._unit_count = 0
+        self._match_total = 0
         self.var_count.set("")
 
     def _import_kw(self):
@@ -1328,7 +1753,7 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("错误", "导入失败：%s" % e, parent=self)
             return
-        words = [w for w in dict.fromkeys(words) if len(w) >= 4]
+        words = [w for w in dict.fromkeys(words) if len(w) >= 2]
         if not self._batch_open:
             self._toggle_batch()
         self.txt.delete("1.0", "end")
@@ -1430,12 +1855,18 @@ class App(tk.Tk):
 
     def _add(self, t: Task):
         if t.status == "ok":
+            total = int(getattr(t, "total", 0) or 0)
+            self._match_total += total
+            if total > len(t.units):
+                self._log("[%s] 官网共匹配 %d 条，接口每次只返回前 %d 条；"
+                          "补充关键字可缩小范围" % (t.keyword, total, len(t.units)))
             for u in t.units:
                 row = dict(u)
                 row["keyword"] = t.keyword
                 row["status"] = "成功"
                 row["detail"] = (t.detail or {}).get(u.get("unitGuid", ""))
                 self.rows.append(row)
+                self._unit_count += 1
                 self._add_table_row(row,
                                     [u.get("province", t.province_name),
                                      u.get("unitName", ""),
@@ -1453,7 +1884,10 @@ class App(tk.Tk):
             self._add_table_row(row, [t.province_name,
                                       "【%s】%s" % (t.keyword, label), "", "", ""],
                                 has_link=False)
-        self.var_count.set("查询结果：%d 条记录" % len(self.rows))
+        extra = ""
+        if self._match_total > self._unit_count:
+            extra = "（官网匹配 %d 条，仅显示前 20 条）" % self._match_total
+        self.var_count.set("查询结果：%d 条%s" % (len(self.rows), extra))
 
     # ---------- 导出（自适应详情列） ----------
     def _export(self, fmt):
