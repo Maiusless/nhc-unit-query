@@ -2254,6 +2254,12 @@ class App(tk.Tk):
             if self.engine:
                 self.engine.stop()
         self._pump_running = False
+        if self.overlay is not None:
+            try:
+                self.overlay.close()          # 先停掉转圈的 after，避免退出时报 invalid command
+            except Exception:
+                pass
+            self.overlay = None
         for aid in list(self._after_ids) + [self._pump_id, self._engine_id]:
             if aid:
                 try:
