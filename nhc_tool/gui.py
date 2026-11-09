@@ -165,6 +165,11 @@ SUBJECT_COLORS = {
     "dark": ("#7bb8ff", "#54d2b4", "#c9a6ff", "#ffb473", "#8be0a8", "#ff9fc6"),
 }
 
+# 每个科室前的符号。Tk 8.6 走 GDI 渲染，emoji 是**单色线条**（不是彩色），
+# 且只能选 Unicode 6.0 时代的老 emoji（Win7 的 Segoe UI Symbol 才有字形）；
+# 想换图标改这一行即可，改回 "▍" 就是原来的竖条。
+SUBJECT_BULLET = "🏥"
+
 
 def _split_outside_brackets(s, seps):
     """按 seps 拆分，但括号内的分隔符不拆（"内科（A、B）" 保持完整）。"""
@@ -888,7 +893,7 @@ class DetailDialog(MemoWindow):
                 i = (i + 1) % n
             prev = i
             tag = "sc%d" % i
-            self.txt.insert("end", "▍ ", tag)
+            self.txt.insert("end", SUBJECT_BULLET + " ", tag)
             self.txt.insert("end", name + "\n", ("sname", tag))
             if subs:
                 self.txt.insert("end", "    " + " · ".join(subs) + "\n", "ssub")
@@ -1236,9 +1241,9 @@ class App(tk.Tk):
                               width=12, command=self._search)
         self.btn.grid(row=1, column=2, sticky="ns", pady=(4, 0))
 
-        ttk.Label(card, text="注：至少输入机构名称中连续的 2 个字即可模糊查询，"
-                             "例如“中国医学科学院北京协和医院”，输入“协和”即可；"
-                             "字数越少结果越多，官网接口每次最多返回前 20 条。",
+        ttk.Label(card, text="注：至少输入机构名称中连续的 4 个字即可模糊查询，"
+                             "例如“中国医学科学院北京协和医院”，输入“协和医院”即可；"
+                             "官网接口每次最多返回前 20 条，可用更多字缩小范围。",
                   style="Sub.TLabel").grid(row=2, column=0, columnspan=3,
                                            sticky="w", pady=(10, 0))
 
@@ -1259,7 +1264,7 @@ class App(tk.Tk):
         self.lbl_count.pack(side="left")
 
         self.batch = ttk.Frame(self, style="Card.TFrame", padding=14)
-        ttk.Label(self.batch, text="批量查询：每行一个医疗机构名称（至少 2 个字）",
+        ttk.Label(self.batch, text="批量查询：每行一个医疗机构名称（至少 4 个字）",
                   style="Sub.TLabel").pack(anchor="w")
         wrapb = ttk.Frame(self.batch, style="Card.TFrame")
         wrapb.pack(fill="both", expand=True, pady=(6, 8))
@@ -1636,8 +1641,8 @@ class App(tk.Tk):
         if not kw:
             messagebox.showwarning("提示", "请输入医疗机构名称", parent=self)
             return
-        if len(kw) < 2:
-            messagebox.showwarning("提示", "医疗机构名称至少需要连续的 2 个字", parent=self)
+        if len(kw) < 4:
+            messagebox.showwarning("提示", "医疗机构名称至少需要连续的 4 个字", parent=self)
             return
         self._clear()
         pc, pn = self._prov()
@@ -1651,9 +1656,9 @@ class App(tk.Tk):
         if not kws:
             messagebox.showwarning("提示", "请在批量框里输入名称（每行一个）", parent=self)
             return
-        bad = [k for k in kws if len(k) < 2]
+        bad = [k for k in kws if len(k) < 4]
         if bad:
-            messagebox.showwarning("提示", "以下名称少于 2 个字：\n" + "、".join(bad[:8]),
+            messagebox.showwarning("提示", "以下名称少于 4 个字：\n" + "、".join(bad[:8]),
                                    parent=self)
             return
         self._clear()
@@ -1758,7 +1763,7 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("错误", "导入失败：%s" % e, parent=self)
             return
-        words = [w for w in dict.fromkeys(words) if len(w) >= 2]
+        words = [w for w in dict.fromkeys(words) if len(w) >= 4]
         if not self._batch_open:
             self._toggle_batch()
         self.txt.delete("1.0", "end")

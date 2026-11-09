@@ -84,9 +84,9 @@ def run_cli(args):
     if args.kwfile:
         with open(args.kwfile, "r", encoding="utf-8-sig", errors="ignore") as f:
             kws += [ln.strip() for ln in f if ln.strip()]
-    kws = [k for k in dict.fromkeys(kws) if len(k) >= 2]
+    kws = [k for k in dict.fromkeys(kws) if len(k) >= 4]
     if not kws:
-        print("没有有效的关键字（需至少 2 个连续汉字）")
+        print("没有有效的关键字（需至少 4 个连续汉字）")
         return 1
 
     tasks = [Task(args.province, "", k) for k in kws]
