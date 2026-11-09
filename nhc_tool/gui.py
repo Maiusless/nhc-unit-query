@@ -1974,28 +1974,48 @@ class App(tk.Tk):
             self._toggle_batch()
         self._run([Task(pc, pn, k) for k in kws])
 
+    def _int_setting(self, var, default, lo, hi):
+        """读取数值设置；Spinbox 里被输入了非数字时退回默认值（否则 .get() 抛 TclError）。"""
+        try:
+            v = int(var.get())
+        except Exception:
+            v = default
+        v = max(lo, min(hi, v))
+        try:
+            var.set(v)          # 把纠正后的值写回界面，用户能看见实际生效值
+        except Exception:
+            pass
+        return v
+
     def _run(self, tasks):
+        workers = self._int_setting(self.var_workers, 10, 1, 32)
+        tries = self._int_setting(self.var_tries, 15, 1, 60)
         if self.var_mode.get() == "proxy" and (not self.pool or not self.pool.proxies):
             if not self._ensure_pool():
                 return
+        # 先把引擎建好再置 _busy：构造失败时不会把界面卡在「查询中」
+        try:
+            self.engine = Engine(self.pool, tasks, mode=self.var_mode.get(),
+                                 workers=workers,
+                                 log=lambda m: self.events.put(("log", m)),
+                                 state=self.state,
+                                 on_result=lambda t: self.events.put(("result", t)),
+                                 on_progress=lambda: self.events.put(("prog", None)),
+                                 on_activity=lambda kw, ph: self.events.put(("act", (kw, ph))),
+                                 solve_tries=tries,
+                                 fetch_detail=False,
+                                 allow_manual=self.var_manual.get())
+        except Exception as e:
+            messagebox.showerror("错误", "无法启动查询：%s" % e, parent=self)
+            return
         self.tasks = tasks
         self._busy = True
         self._activity = ""
-        self.engine = Engine(self.pool, tasks, mode=self.var_mode.get(),
-                             workers=self.var_workers.get(),
-                             log=lambda m: self.events.put(("log", m)),
-                             state=self.state,
-                             on_result=lambda t: self.events.put(("result", t)),
-                             on_progress=lambda: self.events.put(("prog", None)),
-                             on_activity=lambda kw, ph: self.events.put(("act", (kw, ph))),
-                             solve_tries=self.var_tries.get(),
-                             fetch_detail=False,
-                             allow_manual=self.var_manual.get())
         self.overlay = BusyOverlay(self, len(tasks), self._stop)
         self._refresh_ip()
         self._log("开始查询 %d 条（%s 模式，%d 并发）"
                   % (len(tasks), "直连" if self.var_mode.get() == "xff" else "代理池",
-                     self.var_workers.get()))
+                     workers))
         threading.Thread(target=self._run_engine, daemon=True).start()
 
     def _ensure_pool(self):
@@ -2073,12 +2093,19 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("错误", "导入失败：%s" % e, parent=self)
             return
-        words = [w for w in dict.fromkeys(words) if len(w) >= 4]
+        uniq = list(dict.fromkeys(words))
+        words = [w for w in uniq if len(w) >= 4]
+        dropped = len(uniq) - len(words)
+        if not words:
+            messagebox.showwarning("提示", "没有可用的名称：每个名称至少需要连续的 4 个字",
+                                   parent=self)
+            return
         if not self._batch_open:
             self._toggle_batch()
         self.txt.delete("1.0", "end")
         self.txt.insert("1.0", "\n".join(words))
-        self._log("导入 %d 个名称" % len(words))
+        self._log("导入 %d 个名称%s" % (len(words),
+                                       "（%d 个少于 4 字，已忽略）" % dropped if dropped else ""))
 
     # ---------- 人工验证码 ----------
     def _manual_solve(self, png_bytes, wordlist):
@@ -2101,50 +2128,65 @@ class App(tk.Tk):
         try:
             while True:
                 kind, payload = self.events.get_nowait()
-                if kind == "log":
-                    self._log(payload)
-                elif kind == "cutoff":
-                    self.var_cutoff.set(payload)
-                elif kind == "result":
-                    self._add(payload)
-                elif kind == "prog":
-                    self._prog()
-                elif kind == "act":
-                    kw, ph = payload
-                    self._activity = "%s - %s" % (ph, kw)
-                elif kind == "engine":
-                    ok, err = payload
-                    if ok:
-                        self._log("验证码自动识别引擎已就绪")
-                    else:
-                        self.var_manual.set(True)
-                        self._log("⚠ 无法加载验证码自动识别引擎：%s" % err)
-                        self._log("  已自动切换为「手动输入验证码」，其余功能不受影响。")
-                        messagebox.showwarning(
-                            "验证码引擎不可用",
-                            "本机无法加载验证码自动识别引擎：\n%s\n\n"
-                            "常见原因：CPU 过老（不支持 AVX 指令集）。\n\n"
-                            "已自动切换为手动输入模式 —— 查询时会弹窗让你点选验证码，\n"
-                            "批量查询、机构详情、导出等功能均不受影响。\n"
-                            "建议把「并发线程数」调小（如 2~4）。" % err,
-                            parent=self)
-                elif kind == "done":
-                    self._busy = False
-                    self.btn.config(state="normal")
-                    self.var_status.set("完成")
-                    if self.overlay is not None:
-                        self.overlay.close()
-                        self.overlay = None
-                    self._log("=== 全部结束 ===")
-                    self._prog()
-                    self._refresh_ip()
+                # 单条事件处理失败不能拖垮整个泵：否则后续结果 / done 都收不到，
+                # 界面会永远停在「查询中」且所有按钮被 _busy 挡住。
+                try:
+                    self._handle_event(kind, payload)
+                except Exception as e:
+                    try:
+                        self._log("⚠ 处理「%s」事件出错：%s %s"
+                                  % (kind, type(e).__name__, str(e)[:80]))
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
-        if self._pump_running:
-            try:
-                self._pump_id = self.after(120, self._pump)
-            except Exception:
-                pass
+        except Exception:
+            pass
+        finally:
+            if self._pump_running:
+                try:
+                    self._pump_id = self.after(120, self._pump)
+                except Exception:
+                    pass
+
+    def _handle_event(self, kind, payload):
+        if kind == "log":
+            self._log(payload)
+        elif kind == "cutoff":
+            self.var_cutoff.set(payload)
+        elif kind == "result":
+            self._add(payload)
+        elif kind == "prog":
+            self._prog()
+        elif kind == "act":
+            kw, ph = payload
+            self._activity = "%s - %s" % (ph, kw)
+        elif kind == "engine":
+            ok, err = payload
+            if ok:
+                self._log("验证码自动识别引擎已就绪")
+            else:
+                self.var_manual.set(True)
+                self._log("⚠ 无法加载验证码自动识别引擎：%s" % err)
+                self._log("  已自动切换为「手动输入验证码」，其余功能不受影响。")
+                messagebox.showwarning(
+                    "验证码引擎不可用",
+                    "本机无法加载验证码自动识别引擎：\n%s\n\n"
+                    "常见原因：CPU 过老（不支持 AVX 指令集）。\n\n"
+                    "已自动切换为手动输入模式 —— 查询时会弹窗让你点选验证码，\n"
+                    "批量查询、机构详情、导出等功能均不受影响。\n"
+                    "建议把「并发线程数」调小（如 2~4）。" % err,
+                    parent=self)
+        elif kind == "done":
+            self._busy = False
+            self.btn.config(state="normal")
+            self.var_status.set("完成")
+            if self.overlay is not None:
+                self.overlay.close()
+                self.overlay = None
+            self._log("=== 全部结束 ===")
+            self._prog()
+            self._refresh_ip()
 
     def _log(self, msg):
         self.logtxt.config(state="normal")
@@ -2213,9 +2255,20 @@ class App(tk.Tk):
                 "是否一并抓取并导出机构详情？\n"
                 "（地址 / 登记号 / 诊疗科目 / 法定代表人 / 所有制形式 / 经营性质）",
                 parent=self)
+
+        # 先问保存路径，再抓详情：否则用户等抓取跑完又点「取消」，白等一场
+        default = "全国医疗机构查询_%s.%s" % (time.strftime("%Y%m%d_%H%M%S"), fmt)
+        p = filedialog.asksaveasfilename(defaultextension="." + fmt, initialfile=default,
+                                         filetypes=[("Excel", "*.xlsx")] if fmt == "xlsx"
+                                         else [("CSV", "*.csv")])
+        if not p:
+            return
+
         if with_detail and any(not r.get("detail") for r in data if r.get("unitGuid")):
             if not self._fetch_all_details(data):
                 return
+            if not self.winfo_exists():
+                return          # 抓详情期间用户把窗口关了，别再往下走（否则弹框/保存会报错）
 
         cols = [("keyword", "关键字", 20), ("province", "省份", 12),
                 ("unitName", "机构名称", 42), ("unitOrganName", "审批机关", 32),
@@ -2239,12 +2292,6 @@ class App(tk.Tk):
                     cells.append(_cell(d.get(key, ""), key))
             rows.append(cells)
 
-        default = "全国医疗机构查询_%s.%s" % (time.strftime("%Y%m%d_%H%M%S"), fmt)
-        p = filedialog.asksaveasfilename(defaultextension="." + fmt, initialfile=default,
-                                         filetypes=[("Excel", "*.xlsx")] if fmt == "xlsx"
-                                         else [("CSV", "*.csv")])
-        if not p:
-            return
         try:
             if fmt == "xlsx":
                 from openpyxl import Workbook
