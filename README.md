@@ -17,11 +17,10 @@
 
 | Release 资产 | 大小 | 说明 |
 |---|---|---|
-| `nhc-query-tool.exe` | 136 MB | **图形界面主程序，只需要这一个**（即本地构建的 `卫健查询工具.exe`） |
-| `nhc-cli.exe` | 136 MB | 命令行版（批量脚本 / 诊断），可选 |
-| `nhc-query-tool-win7-folder.zip` | 130 MB | Win7 兜底：单文件版在个别 Win7 环境起不来时用，解压后双击里面的 exe |
+| `nhc-query-tool.exe` | 136 MB | **图形界面主程序，只需要这一个**（即本地构建的 `卫健查询工具.exe`，Win7 SP1 ~ 11 通用） |
 
 > GitHub 的 Release 资产名**不支持中文**，因此资产用英文名，程序与本地构建的完全一致。
+> 需要命令行版或文件夹版时，可用 `build_exe.py --cli-only` / `--onedir` 自行打包（见「开发与打包」）。
 > 下载后放到任意目录双击即可，**无需安装任何东西，也无需管理员权限**。
 
 > 首次运行若弹「Windows 已保护你的电脑」，点「更多信息」→「仍要运行」即可
@@ -96,8 +95,8 @@
 | 文件 | 大小 | 说明 |
 |---|---|---|
 | `卫健查询工具.exe` | 136 MB | **交付给客户只需这一个**（Win7 SP1 ~ 11 通用） |
-| `nhc_cli.exe` | 136 MB | 命令行版（批量脚本 / 诊断），可选 |
-| `卫健查询工具-文件夹版/` | 261 MB | 兜底方案：把 UCRT 与 exe 放同一目录，个别 Win7 环境用得上 |
+
+> 需要命令行版（`nhc_cli.exe`）或文件夹版时：`build_exe.py --cli-only` / `--onedir`。
 
 > 这些二进制**不进 git**（GitHub 单文件上限 100 MB），已发布到
 > [Releases](https://github.com/Maiusless/nhc-unit-query/releases)（资产名见上表），
